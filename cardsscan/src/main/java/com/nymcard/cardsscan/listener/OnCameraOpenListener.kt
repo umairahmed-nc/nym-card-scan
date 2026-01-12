@@ -1,7 +1,11 @@
 package com.nymcard.cardsscan.listener
 
-import android.hardware.Camera
-
+/**
+ * @deprecated This interface is deprecated as we've moved to CameraX.
+ * CameraX handles camera operations internally.
+ */
+@Deprecated("Use CameraX instead")
 interface OnCameraOpenListener {
-    fun onCameraOpen(camera: Camera?)
+    @Deprecated("CameraX handles camera initialization internally")
+    fun onCameraOpen(camera: Any?)
 }

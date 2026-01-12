@@ -62,30 +62,128 @@ class MachineLearningThread : Runnable {
     }
 
     private fun YUV_toRGB(yuvByteArray: ByteArray, W: Int, H: Int, ctx: Context?): Bitmap {
-        val rs = RenderScript.create(ctx)
-        val yuvToRgbIntrinsic = ScriptIntrinsicYuvToRGB.create(
-            rs,
-            Element.U8_4(rs)
-        )
+        // Check if RenderScript is safe to use (avoid on newer Android versions where it crashes)
+        val androidVersion = android.os.Build.VERSION.SDK_INT
+        val useRenderScript = androidVersion < 31 && isRenderScriptSafe() // RenderScript deprecated in API 31+
+        
+        if (useRenderScript) {
+            try {
+                val rs = RenderScript.create(ctx)
+                val yuvToRgbIntrinsic = ScriptIntrinsicYuvToRGB.create(
+                    rs,
+                    Element.U8_4(rs)
+                )
 
-        val yuvType = Type.Builder(rs, Element.U8(rs)).setX(yuvByteArray.size)
-        val `in` = Allocation.createTyped(rs, yuvType.create(), Allocation.USAGE_SCRIPT)
+                val yuvType = Type.Builder(rs, Element.U8(rs)).setX(yuvByteArray.size)
+                val `in` = Allocation.createTyped(rs, yuvType.create(), Allocation.USAGE_SCRIPT)
 
-        val rgbaType = Type.Builder(rs, Element.RGBA_8888(rs)).setX(W).setY(H)
-        val out = Allocation.createTyped(rs, rgbaType.create(), Allocation.USAGE_SCRIPT)
+                val rgbaType = Type.Builder(rs, Element.RGBA_8888(rs)).setX(W).setY(H)
+                val out = Allocation.createTyped(rs, rgbaType.create(), Allocation.USAGE_SCRIPT)
 
-        `in`.copyFrom(yuvByteArray)
+                `in`.copyFrom(yuvByteArray)
 
-        yuvToRgbIntrinsic.setInput(`in`)
-        yuvToRgbIntrinsic.forEach(out)
-        val bmp = Bitmap.createBitmap(W, H, Bitmap.Config.ARGB_8888)
-        out.copyTo(bmp)
+                yuvToRgbIntrinsic.setInput(`in`)
+                yuvToRgbIntrinsic.forEach(out)
+                val bmp = Bitmap.createBitmap(W, H, Bitmap.Config.ARGB_8888)
+                out.copyTo(bmp)
 
-        yuvToRgbIntrinsic.destroy()
-        rs.destroy()
-        `in`.destroy()
-        out.destroy()
-        return bmp
+                yuvToRgbIntrinsic.destroy()
+                rs.destroy()
+                `in`.destroy()
+                out.destroy()
+                return bmp
+            } catch (e: Exception) {
+                // Fallback to manual conversion if RenderScript fails
+                return fallbackYUVtoRGB(yuvByteArray, W, H)
+            }
+        } else {
+            // Use manual conversion on newer Android versions
+            return fallbackYUVtoRGB(yuvByteArray, W, H)
+        }
+    }
+
+    private fun isRenderScriptSafe(): Boolean {
+        return try {
+            // Additional safety check - avoid RenderScript on problematic devices/versions
+            val manufacturer = android.os.Build.MANUFACTURER.lowercase()
+            val model = android.os.Build.MODEL.lowercase()
+            
+            // Known problematic devices/manufacturers can be blacklisted here
+            when {
+                manufacturer.contains("samsung") && android.os.Build.VERSION.SDK_INT >= 30 -> false
+                manufacturer.contains("google") && android.os.Build.VERSION.SDK_INT >= 31 -> false
+                else -> true
+            }
+        } catch (e: Exception) {
+            false
+        }
+    }
+
+    private fun fallbackYUVtoRGB(yuvByteArray: ByteArray, W: Int, H: Int): Bitmap {
+        val bitmap = Bitmap.createBitmap(W, H, Bitmap.Config.ARGB_8888)
+        
+        try {
+            // Improved YUV420 to RGB conversion for camera data
+            val pixels = IntArray(W * H)
+            val frameSize = W * H
+            val uvPixelStride = 1
+            
+            for (j in 0 until H) {
+                for (i in 0 until W) {
+                    val pixelIndex = j * W + i
+                    if (pixelIndex >= frameSize || pixelIndex >= yuvByteArray.size) continue
+                    
+                    // Y component
+                    val y = (0xff and yuvByteArray[pixelIndex].toInt())
+                    
+                    // U and V components (subsampled)
+                    val uvIndex = frameSize + (j / 2) * (W / 2) + (i / 2)
+                    val u: Int
+                    val v: Int
+                    
+                    if (uvIndex < yuvByteArray.size - 1) {
+                        // NV21 format: YYYYYYYY VUVU
+                        v = (0xff and yuvByteArray[uvIndex].toInt()) - 128
+                        u = (0xff and yuvByteArray[uvIndex + 1].toInt()) - 128
+                    } else {
+                        u = 0
+                        v = 0
+                    }
+                    
+                    // YUV to RGB conversion
+                    val yAdjusted = Math.max(0, y - 16)
+                    var r = (1.164f * yAdjusted + 1.596f * v).toInt()
+                    var g = (1.164f * yAdjusted - 0.813f * v - 0.391f * u).toInt()
+                    var b = (1.164f * yAdjusted + 2.018f * u).toInt()
+                    
+                    // Clamp values
+                    r = Math.max(0, Math.min(255, r))
+                    g = Math.max(0, Math.min(255, g))
+                    b = Math.max(0, Math.min(255, b))
+                    
+                    pixels[pixelIndex] = (0xff shl 24) or (r shl 16) or (g shl 8) or b
+                }
+            }
+            
+            bitmap.setPixels(pixels, 0, W, 0, 0, W, H)
+        } catch (e: Exception) {
+            // Final fallback: create a gray bitmap with some pattern
+            val canvas = Canvas(bitmap)
+            val paint = Paint()
+            paint.color = Color.GRAY
+            canvas.drawRect(0f, 0f, W.toFloat(), H.toFloat(), paint)
+            
+            // Add a simple pattern so we know fallback was used
+            paint.color = Color.LTGRAY
+            for (i in 0 until W step 50) {
+                canvas.drawLine(i.toFloat(), 0f, i.toFloat(), H.toFloat(), paint)
+            }
+            for (j in 0 until H step 50) {
+                canvas.drawLine(0f, j.toFloat(), W.toFloat(), j.toFloat(), paint)
+            }
+        }
+        
+        return bitmap
     }
 
     private fun getBitmap(

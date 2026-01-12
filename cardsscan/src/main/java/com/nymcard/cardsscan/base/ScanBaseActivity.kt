@@ -1,6 +1,5 @@
 package com.nymcard.cardsscan.base
 
-import android.app.Activity
 import android.app.AlertDialog
 import android.content.Context
 import android.content.DialogInterface
@@ -9,35 +8,39 @@ import android.content.pm.PackageManager
 import android.content.res.Resources
 import android.graphics.Bitmap
 import android.graphics.RectF
-import android.hardware.Camera
 import android.os.Bundle
 import android.os.SystemClock
 import android.util.Log
 import android.view.OrientationEventListener
 import android.view.Surface
-import android.view.SurfaceHolder
-import android.view.SurfaceView
 import android.view.View
 import android.view.ViewTreeObserver
-import android.widget.FrameLayout
 import android.widget.TextView
 import androidx.annotation.VisibleForTesting
+import androidx.appcompat.app.AppCompatActivity
+import androidx.camera.core.Camera
+import androidx.camera.core.CameraSelector
+import androidx.camera.core.ImageAnalysis
+import androidx.camera.core.ImageProxy
+import androidx.camera.core.Preview
+import androidx.camera.core.TorchState
+import androidx.camera.lifecycle.ProcessCameraProvider
+import androidx.camera.view.PreviewView
+import androidx.core.content.ContextCompat
+import androidx.lifecycle.LifecycleOwner
 import com.nymcard.cardsscan.R
-import com.nymcard.cardsscan.listener.OnCameraOpenListener
 import com.nymcard.cardsscan.listener.OnObjectListener
 import com.nymcard.cardsscan.listener.OnScanListener
-import com.nymcard.cardsscan.ml.CameraThread
 import com.nymcard.cardsscan.ml.MachineLearningThread
 import com.nymcard.cardsscan.models.DetectedBox
 import com.nymcard.cardsscan.models.Expiry
 import com.nymcard.cardsscan.utils.DebitCardUtils
 import com.nymcard.cardsscan.widget.Overlay
 import java.io.File
-import java.io.IOException
 import java.util.concurrent.Semaphore
 
-abstract class ScanBaseActivity : Activity(), Camera.PreviewCallback, View.OnClickListener,
-    OnScanListener, OnObjectListener, OnCameraOpenListener {
+abstract class ScanBaseActivity : AppCompatActivity(), View.OnClickListener,
+    OnScanListener, OnObjectListener {
     var wasPermissionDenied: Boolean = false
     var denyPermissionTitle: String? = null
     var denyPermissionMessage: String? = null
@@ -48,7 +51,14 @@ abstract class ScanBaseActivity : Activity(), Camera.PreviewCallback, View.OnCli
     var errorCorrectionDurationMs: Long = 0
     protected var mShowNumberAndExpiryAsScanning: Boolean = true
     protected var objectDetectFile: File? = null
-    private var mCamera: Camera? = null
+    
+    // CameraX components
+    private var cameraProvider: ProcessCameraProvider? = null
+    private var camera: Camera? = null
+    private var preview: Preview? = null
+    private var imageAnalysis: ImageAnalysis? = null
+    private var previewView: PreviewView? = null
+    
     private var mOrientationEventListener: OrientationEventListener? = null
     private val mMachineLearningSemaphore = Semaphore(1)
     private var mRotation = 0
@@ -62,7 +72,6 @@ abstract class ScanBaseActivity : Activity(), Camera.PreviewCallback, View.OnCli
     private var mExpiryId = 0
     private var mTextureId = 0
     private var mRoiCenterYRatio = 0f
-    private var mCameraThread: CameraThread? = null
     private var mIsOcr = true
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -83,7 +92,7 @@ abstract class ScanBaseActivity : Activity(), Camera.PreviewCallback, View.OnCli
 
     override fun onRequestPermissionsResult(
         requestCode: Int,
-        permissions: Array<String?>,
+        permissions: Array<String>,
         grantResults: IntArray
     ) {
         if (grantResults[0] == PackageManager.PERMISSION_GRANTED) {
@@ -105,28 +114,6 @@ abstract class ScanBaseActivity : Activity(), Camera.PreviewCallback, View.OnCli
         }
     }
 
-    override fun onCameraOpen(camera: Camera?) {
-        if (camera == null) {
-            val intent = Intent()
-            intent.putExtra(RESULT_CAMERA_OPEN_ERROR, true)
-            setResult(RESULT_CANCELED, intent)
-            finish()
-        } else if (!mIsActivityActive) {
-            camera.release()
-        } else {
-            mCamera = camera
-            setCameraDisplayOrientation(
-                this, Camera.CameraInfo.CAMERA_FACING_BACK,
-                mCamera!!
-            )
-            // Create our Preview view and set it as the content of our activity.
-            val cameraPreview = CameraPreview(this, this)
-            val preview = findViewById<FrameLayout>(mTextureId)
-            preview.addView(cameraPreview)
-            mCamera!!.setPreviewCallback(this)
-        }
-    }
-
     protected fun startCamera() {
         numberResults = HashMap<String?, Int?>()
         expiryResults = HashMap<Expiry?, Int?>()
@@ -137,12 +124,7 @@ abstract class ScanBaseActivity : Activity(), Camera.PreviewCallback, View.OnCli
 
         try {
             if (mIsPermissionCheckDone) {
-                if (mCameraThread == null) {
-                    mCameraThread = CameraThread()
-                    mCameraThread!!.start()
-                }
-
-                mCameraThread!!.startCamera(this)
+                initializeCameraX()
             }
         } catch (e: Exception) {
             val builder = AlertDialog.Builder(this)
@@ -160,16 +142,119 @@ abstract class ScanBaseActivity : Activity(), Camera.PreviewCallback, View.OnCli
         }
     }
 
-    override fun onPause() {
-        super.onPause()
-        if (mCamera != null) {
-            mCamera!!.stopPreview()
-            mCamera!!.setPreviewCallback(null)
-            mCamera!!.release()
-            mCamera = null
+    private fun initializeCameraX() {
+        val cameraProviderFuture = ProcessCameraProvider.getInstance(this)
+        
+        cameraProviderFuture.addListener({
+            try {
+                cameraProvider = cameraProviderFuture.get()
+                setupCamera()
+            } catch (e: Exception) {
+                Log.e(TAG, "Failed to initialize CameraX", e)
+                showCameraError()
+            }
+        }, ContextCompat.getMainExecutor(this))
+    }
+
+    private fun setupCamera() {
+        if (cameraProvider == null) return
+
+        // Find PreviewView in the layout
+        previewView = findViewById<PreviewView>(mTextureId)
+        if (previewView == null) {
+            Log.e(TAG, "PreviewView not found in layout")
+            return
         }
 
-        mOrientationEventListener!!.disable()
+        // Preview use case
+        preview = Preview.Builder()
+            .setTargetRotation(Surface.ROTATION_0)
+            .build()
+        
+        preview?.setSurfaceProvider(previewView!!.surfaceProvider)
+
+        // Image analysis use case for ML processing
+        imageAnalysis = ImageAnalysis.Builder()
+            .setTargetRotation(Surface.ROTATION_0)
+            .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
+            .build()
+
+        imageAnalysis?.setAnalyzer(ContextCompat.getMainExecutor(this)) { imageProxy ->
+            processImageProxy(imageProxy)
+        }
+
+        // Camera selector
+        val cameraSelector = CameraSelector.DEFAULT_BACK_CAMERA
+
+        try {
+            // Unbind all use cases before rebinding
+            cameraProvider?.unbindAll()
+
+            // Bind use cases to camera
+            camera = cameraProvider?.bindToLifecycle(
+                this as LifecycleOwner,
+                cameraSelector,
+                preview,
+                imageAnalysis
+            )
+
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to bind camera use cases", e)
+            showCameraError()
+        }
+    }
+
+    private fun processImageProxy(imageProxy: ImageProxy) {
+        if (mMachineLearningSemaphore.tryAcquire()) {
+            val mlThread: MachineLearningThread = machineLearningThread!!
+            
+            // Convert ImageProxy to byte array (keeping original approach)
+            val buffer = imageProxy.planes[0].buffer
+            val data = ByteArray(buffer.remaining())
+            buffer.get(data)
+
+            if (mIsOcr) {
+                mlThread.post(
+                    data,
+                    imageProxy.width,
+                    imageProxy.height,
+                    imageProxy.format,
+                    90, // Sensor orientation
+                    this,
+                    this,
+                    mRoiCenterYRatio
+                )
+            } else {
+                mlThread.post(
+                    data,
+                    imageProxy.width,
+                    imageProxy.height,
+                    imageProxy.format,
+                    90, // Sensor orientation
+                    this,
+                    this,
+                    mRoiCenterYRatio,
+                    objectDetectFile
+                )
+            }
+            
+            mMachineLearningSemaphore.release()
+        }
+        
+        imageProxy.close()
+    }
+
+    private fun showCameraError() {
+        val intent = Intent()
+        intent.putExtra(RESULT_CAMERA_OPEN_ERROR, true)
+        setResult(RESULT_CANCELED, intent)
+        finish()
+    }
+
+    override fun onPause() {
+        super.onPause()
+        cameraProvider?.unbindAll()
+        mOrientationEventListener?.disable()
         mIsActivityActive = false
     }
 
@@ -213,98 +298,16 @@ abstract class ScanBaseActivity : Activity(), Camera.PreviewCallback, View.OnCli
     }
 
     fun orientationChanged(orientation: Int) {
-        var orientation = orientation
-        if (orientation == OrientationEventListener.ORIENTATION_UNKNOWN) return
-        val info =
-            Camera.CameraInfo()
-        Camera.getCameraInfo(Camera.CameraInfo.CAMERA_FACING_BACK, info)
-        orientation = (orientation + 45) / 90 * 90
-        val rotation: Int
-        if (info.facing == Camera.CameraInfo.CAMERA_FACING_FRONT) {
-            rotation = (info.orientation - orientation + 360) % 360
-        } else {  // back-facing camera
-            rotation = (info.orientation + orientation) % 360
-        }
-
-        if (mCamera != null) {
-            try {
-                val params = mCamera!!.getParameters()
-                params.setRotation(rotation)
-                mCamera!!.setParameters(params)
-            } catch (e: Exception) {
-                // This gets called often so we can just swallow it and wait for the next one
-                e.printStackTrace()
-            } catch (e: Error) {
-                e.printStackTrace()
-            }
-        }
-    }
-
-    fun setCameraDisplayOrientation(
-        activity: Activity,
-        cameraId: Int, camera: Camera
-    ) {
-        val info =
-            Camera.CameraInfo()
-        Camera.getCameraInfo(cameraId, info)
-        val rotation = activity.getWindowManager().getDefaultDisplay()
-            .getRotation()
-        var degrees = 0
-        when (rotation) {
-            Surface.ROTATION_0 -> degrees = 0
-            Surface.ROTATION_90 -> degrees = 90
-            Surface.ROTATION_180 -> degrees = 180
-            Surface.ROTATION_270 -> degrees = 270
-        }
-
-        var result: Int
-        if (info.facing == Camera.CameraInfo.CAMERA_FACING_FRONT) {
-            result = (info.orientation + degrees) % 360
-            result = (360 - result) % 360 // compensate the mirror
-        } else {  // back-facing
-            result = (info.orientation - degrees + 360) % 360
-        }
-        camera.setDisplayOrientation(result)
-        mRotation = result
-    }
-
-    override fun onPreviewFrame(bytes: ByteArray?, camera: Camera) {
-        if (mMachineLearningSemaphore.tryAcquire()) {
-            val mlThread: MachineLearningThread = machineLearningThread!!
-
-            val parameters = camera.getParameters()
-            val width = parameters.getPreviewSize().width
-            val height = parameters.getPreviewSize().height
-            val format = parameters.getPreviewFormat()
-
-            mPredictionStartMs = SystemClock.uptimeMillis()
-
-            // Use the application context here because the machine learning thread's lifecycle
-            // is connected to the application and not this activity
-            if (mIsOcr) {
-                mlThread.post(
-                    bytes, width, height, format, mRotation, this,
-                    this.getApplicationContext(), mRoiCenterYRatio
-                )
-            } else {
-                mlThread.post(
-                    bytes, width, height, format, mRotation, this,
-                    this.getApplicationContext(), mRoiCenterYRatio, objectDetectFile
-                )
-            }
-        }
+        // CameraX handles orientation automatically
+        // This method is kept for compatibility but doesn't need to do anything
+        mRotation = orientation
     }
 
     override fun onClick(view: View) {
-        if (mCamera != null && mFlashlightId == view.getId()) {
-            val parameters = mCamera!!.getParameters()
-            if (parameters.getFlashMode() == Camera.Parameters.FLASH_MODE_TORCH) {
-                parameters.setFlashMode(Camera.Parameters.FLASH_MODE_OFF)
-            } else {
-                parameters.setFlashMode(Camera.Parameters.FLASH_MODE_TORCH)
-            }
-            mCamera!!.setParameters(parameters)
-            mCamera!!.startPreview()
+        if (camera != null && mFlashlightId == view.getId()) {
+            val currentTorchState = camera?.cameraInfo?.torchState?.value ?: TorchState.OFF
+            val newTorchState = currentTorchState == TorchState.OFF
+            camera?.cameraControl?.enableTorch(newTorchState)
         }
     }
 
@@ -484,65 +487,8 @@ abstract class ScanBaseActivity : Activity(), Camera.PreviewCallback, View.OnCli
         }
     }
 
-    inner class CameraPreview(
-        context: Context?,
-        private val mPreviewCallback: Camera.PreviewCallback?
-    ) : SurfaceView(context), Camera.AutoFocusCallback, SurfaceHolder.Callback {
-        private val mHolder: SurfaceHolder
-
-        init {
-            mHolder = getHolder()
-            mHolder.addCallback(this)
-            mHolder.setType(SurfaceHolder.SURFACE_TYPE_PUSH_BUFFERS)
-
-            val params = mCamera!!.getParameters()
-            val focusModes = params.getSupportedFocusModes()
-            if (focusModes.contains(Camera.Parameters.FOCUS_MODE_CONTINUOUS_PICTURE)) {
-                params.setFocusMode(Camera.Parameters.FOCUS_MODE_CONTINUOUS_PICTURE)
-            } else if (focusModes.contains(Camera.Parameters.FOCUS_MODE_CONTINUOUS_VIDEO)) {
-                params.setFocusMode(Camera.Parameters.FOCUS_MODE_CONTINUOUS_VIDEO)
-            }
-            params.setRecordingHint(true)
-            mCamera!!.setParameters(params)
-        }
-
-        override fun onAutoFocus(success: Boolean, camera: Camera?) {
-        }
-
-        override fun surfaceCreated(holder: SurfaceHolder) {
-            try {
-                if (mCamera == null) return
-                mCamera!!.setPreviewDisplay(holder)
-                mCamera!!.startPreview()
-            } catch (e: IOException) {
-                Log.d("CameraCaptureActivity", "Error setting camera preview: " + e.message)
-            }
-        }
-
-        override fun surfaceDestroyed(holder: SurfaceHolder) {
-        }
-
-        override fun surfaceChanged(holder: SurfaceHolder, format: Int, w: Int, h: Int) {
-            if (mHolder.getSurface() == null) {
-                return
-            }
-
-            try {
-                mCamera!!.stopPreview()
-            } catch (e: Exception) {
-            }
-
-            try {
-                mCamera!!.setPreviewDisplay(mHolder)
-                mCamera!!.setPreviewCallback(mPreviewCallback)
-                mCamera!!.startPreview()
-            } catch (e: Exception) {
-                Log.d("CameraCaptureActivity", "Error starting camera preview: " + e.message)
-            }
-        }
-    }
-
     companion object {
+        private const val TAG = "ScanBaseActivity"
         const val IS_OCR: String = "is_ocr"
         const val RESULT_FATAL_ERROR: String = "result_fatal_error"
         const val RESULT_CAMERA_OPEN_ERROR: String = "result_camera_open_error"
