@@ -1,0 +1,10 @@
+<resources>
+    <string name="app_name">Cards Scan</string>
+    <string name="scan_card">Scan Bank Card</string>
+    <string name="position_card">Place your card within this frame</string>
+    <string name="deny_permission_title">Camera Access Permission Required</string>
+    <string name="deny_permission_message">To scan the card, you need to grant camera access permission.</string>
+    <string name="deny_permission_button">Confirm</string>
+    <string name="busy_camera_title">Unable to Use Camera</string>
+    <string name="busy_camera">Another app is currently using the camera.</string>
+</resources>
