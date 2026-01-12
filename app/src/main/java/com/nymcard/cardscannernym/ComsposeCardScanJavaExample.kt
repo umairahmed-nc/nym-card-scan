@@ -21,6 +21,7 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.nymcard.cardsscan.activity.ScanActivity
+import com.nymcard.cardsscan.compose.ScanActivityComposeHelper
 
 @Composable
 fun ComposeCardScanJavaExample() {
@@ -49,6 +50,12 @@ fun ComposeCardScanJavaExample() {
         "Scan Card",
         "Scan the front side of your card"
     )
+    val composeIntent = ScanActivityComposeHelper.start(
+        activity as Activity,
+        "Scan Card",
+        "Scan the front side of your card",
+        true
+    )
 
 
     Column(modifier = Modifier.fillMaxSize(), Arrangement.Center, Alignment.CenterHorizontally) {
@@ -63,6 +70,19 @@ fun ComposeCardScanJavaExample() {
                 .padding(bottom = 8.dp)
         ) {
             Text("Launch Activity Scanner")
+        }
+
+        Button(
+            onClick = {
+                scanCardLauncher.launch(
+                    intent
+                )
+            },
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(bottom = 8.dp)
+        ) {
+            Text("Launch Compose Scanner")
         }
 
         if (scannedCard.isNotEmpty())
