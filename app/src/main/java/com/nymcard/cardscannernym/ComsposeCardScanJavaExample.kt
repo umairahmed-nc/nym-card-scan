@@ -43,7 +43,18 @@ fun ComposeCardScanJavaExample() {
             }
         }
     }
-
+    val scanCardComposeLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.StartActivityForResult()
+    ) { result ->
+        if (result.resultCode == Activity.RESULT_OK) {
+            val data = result.data
+            val debitCard = ScanActivityComposeHelper.debitCardFromResult(data!!)
+            debitCard?.let {
+                scannedCard = it.number.toString()
+                // parse your card scan result from 'data'
+            }
+        }
+    }
 
     val intent = ScanActivity.start(
         activity as Activity,
@@ -74,8 +85,8 @@ fun ComposeCardScanJavaExample() {
 
         Button(
             onClick = {
-                scanCardLauncher.launch(
-                    intent
+                scanCardComposeLauncher.launch(
+                    composeIntent
                 )
             },
             modifier = Modifier

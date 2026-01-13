@@ -2,15 +2,14 @@ package com.nymcard.cardsscan.compose
 
 import android.content.Context
 import android.graphics.Bitmap
+import android.util.Log
 import androidx.camera.core.Camera
 import androidx.camera.core.CameraSelector
 import androidx.camera.core.ImageAnalysis
+import androidx.camera.core.ImageProxy
 import androidx.camera.core.Preview
 import androidx.camera.core.TorchState
 import androidx.camera.lifecycle.ProcessCameraProvider
-import androidx.compose.runtime.getValue
-import androidx.compose.runtime.mutableStateOf
-import androidx.compose.runtime.setValue
 import androidx.lifecycle.LifecycleOwner
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
@@ -26,7 +25,8 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
-import java.util.concurrent.Semaphore
+import kotlinx.coroutines.sync.Semaphore
+import java.util.concurrent.Executors
 import javax.inject.Inject
 
 @HiltViewModel
@@ -34,37 +34,37 @@ class ScanViewModel @Inject constructor(
     @ApplicationContext private val context: Context
 ) : ViewModel(), OnScanListener {
 
-    // UI State
+    // ---- UI State ----
     private val _uiState = MutableStateFlow(ScanUiState())
     val uiState: StateFlow<ScanUiState> = _uiState.asStateFlow()
 
-    // Camera state
     private val _cameraState = MutableStateFlow(CameraState())
     val cameraState: StateFlow<CameraState> = _cameraState.asStateFlow()
 
-    // Scan results
     private val _scanResult = MutableStateFlow<ScanResult?>(null)
     val scanResult: StateFlow<ScanResult?> = _scanResult.asStateFlow()
 
-    // Internal state
+    // ---- CameraX / ML ----
     private var camera: Camera? = null
     private var cameraProvider: ProcessCameraProvider? = null
+    private val analysisExecutor = Executors.newSingleThreadExecutor()
     private val machineLearningThread: MachineLearningThread by lazy {
         ScanBaseActivity.machineLearningThread!!
     }
-    private val mMachineLearningSemaphore = Semaphore(1)
-    
-    // Scan tracking
+    private val mlSemaphore = Semaphore(1)
+
+    // ---- Internal scan state ----
     private var numberResults = HashMap<String?, Int?>()
     private var expiryResults = HashMap<Expiry?, Int?>()
     private var firstResultMs: Long = 0
-    private var mSentResponse = false
-    private var mIsActivityActive = true
-    private val errorCorrectionDurationMs: Long = 2000 // 2 seconds
+    private var sentResponse = false
+    private var isActive = true
+    var roiCenterYRatio = 0.5f
+    private val errorCorrectionDurationMs: Long = 2000
 
     init {
-        // Warm up ML thread
         machineLearningThread.warmUp(context)
+        isActive = true
     }
 
     fun updateTexts(scanCardText: String?, positionCardText: String?) {
@@ -74,42 +74,39 @@ class ScanViewModel @Inject constructor(
         )
     }
 
-    fun setDebugMode(debugMode: Boolean) {
-        _uiState.value = _uiState.value.copy(debugMode = debugMode)
+    fun setDebugMode(debug: Boolean) {
+        _uiState.value = _uiState.value.copy(debugMode = debug)
     }
 
     fun setupCamera(
-        cameraProvider: ProcessCameraProvider,
+        provider: ProcessCameraProvider,
         lifecycleOwner: LifecycleOwner,
         preview: Preview,
         imageAnalysis: ImageAnalysis
     ) {
-        this.cameraProvider = cameraProvider
-        
-        // Setup image analysis
-        imageAnalysis.setAnalyzer(
-            androidx.core.content.ContextCompat.getMainExecutor(context)
-        ) { imageProxy ->
+        cameraProvider = provider
+
+        // Set single-thread analyzer
+        imageAnalysis.setAnalyzer(analysisExecutor) { imageProxy ->
             processImageProxy(imageProxy)
         }
 
-        try {
-            // Unbind all use cases before rebinding
-            cameraProvider.unbindAll()
+        val cameraSelector = CameraSelector.DEFAULT_BACK_CAMERA
 
-            // Bind use cases to camera
-            camera = cameraProvider.bindToLifecycle(
+        try {
+            provider.unbindAll()
+            camera = provider.bindToLifecycle(
                 lifecycleOwner,
-                CameraSelector.DEFAULT_BACK_CAMERA,
+                cameraSelector,
                 preview,
                 imageAnalysis
             )
 
             _cameraState.value = _cameraState.value.copy(
                 isInitialized = true,
-                hasError = false
+                hasError = false,
+                errorMessage = null
             )
-
         } catch (e: Exception) {
             _cameraState.value = _cameraState.value.copy(
                 hasError = true,
@@ -118,39 +115,67 @@ class ScanViewModel @Inject constructor(
         }
     }
 
-    private fun processImageProxy(imageProxy: androidx.camera.core.ImageProxy) {
-        if (mMachineLearningSemaphore.tryAcquire()) {
-            // Convert ImageProxy to byte array (keeping original approach)
-            val buffer = imageProxy.planes[0].buffer
-            val data = ByteArray(buffer.remaining())
-            buffer.get(data)
+    private fun processImageProxy(imageProxy: ImageProxy) {
+        try {
+            if (mlSemaphore.tryAcquire()) {
+                val buffer = imageProxy.planes[0].buffer
+                val data = ByteArray(buffer.remaining())
+                buffer.get(data)
 
-            machineLearningThread.post(
-                data,
-                imageProxy.width,
-                imageProxy.height,
-                imageProxy.format,
-                90, // Sensor orientation
-                this,
-                context,
-                0.5f // ROI center Y ratio
-            )
-            
-            mMachineLearningSemaphore.release()
+                machineLearningThread.post(
+                    data,
+                    imageProxy.width,
+                    imageProxy.height,
+                    imageProxy.format,
+                    90,
+                    this,
+                    context,
+                    roiCenterYRatio
+                )
+
+                mlSemaphore.release()
+            }
+        } catch (ex: Exception) {
+            Log.e("ScanViewModelOptimized", "Error processing image: ${ex.message}")
+            // Show "Failed to detect" dialog on any exception during image analysis
+            showErrorDialog()
+        } finally {
+            imageProxy.close()
         }
-        
-        imageProxy.close()
+    }
+
+    private fun showErrorDialog() {
+        if (!sentResponse && isActive) {
+            _uiState.value = _uiState.value.copy(showErrorDialog = true)
+        }
+    }
+
+    fun onErrorDialogRetry() {
+        // Hide dialog and reset scan state
+        _uiState.value = _uiState.value.copy(showErrorDialog = false)
+        resetScanState()
+    }
+
+    fun onErrorDialogCancel() {
+        // Hide dialog and set cancelled result
+        _uiState.value = _uiState.value.copy(showErrorDialog = false)
+        _scanResult.value = ScanResult.Cancelled
     }
 
     fun toggleFlashlight() {
         camera?.let { cam ->
-            val currentTorchState = cam.cameraInfo.torchState.value ?: TorchState.OFF
-            val newTorchState = currentTorchState == TorchState.OFF
-            cam.cameraControl.enableTorch(newTorchState)
-            
-            _cameraState.value = _cameraState.value.copy(
-                isFlashlightOn = newTorchState
-            )
+            val current = cam.cameraInfo.torchState.value ?: TorchState.OFF
+            val newState = current == TorchState.OFF
+            cam.cameraControl.enableTorch(newState)
+
+            _cameraState.value = _cameraState.value.copy(isFlashlightOn = newState)
+        }
+    }
+
+    fun onBackPressed() {
+        if (!sentResponse && isActive) {
+            sentResponse = true
+            _scanResult.value = ScanResult.Cancelled
         }
     }
 
@@ -158,125 +183,17 @@ class ScanViewModel @Inject constructor(
         _scanResult.value = ScanResult.Cancelled
     }
 
-    fun onBackPressed() {
-        if (!mSentResponse && mIsActivityActive) {
-            mSentResponse = true
-            _scanResult.value = ScanResult.Cancelled
-        }
+    fun onActivityPause() {
+        isActive = false
     }
 
-    // OnScanListener implementation
-    override fun onFatalError() {
-        _scanResult.value = ScanResult.Error("Fatal error occurred during scanning")
-    }
-
-    override fun onPrediction(
-        number: String?,
-        expiry: Expiry?,
-        bitmap: Bitmap?,
-        digitBoxes: MutableList<DetectedBox?>?,
-        expiryBox: DetectedBox?
-    ) {
-        if (!mSentResponse && mIsActivityActive) {
-            if (number != null && firstResultMs == 0L) {
-                firstResultMs = System.currentTimeMillis()
-            }
-
-            if (number != null) {
-                incrementNumber(number)
-            }
-            if (expiry != null) {
-                incrementExpiry(expiry)
-            }
-
-            val duration = System.currentTimeMillis() - firstResultMs
-            
-            // Update UI with current predictions
-            if (firstResultMs != 0L) {
-                val currentNumber = getNumberResult()
-                val currentExpiry = getExpiryResult()
-                
-                _uiState.value = _uiState.value.copy(
-                    detectedCardNumber = currentNumber?.let { DebitCardUtils.format(it) },
-                    detectedExpiry = currentExpiry?.format(),
-                    showDetectedInfo = true
-                )
-            }
-
-            // Check if we have enough confidence to return result
-            if (firstResultMs != 0L && duration >= errorCorrectionDurationMs) {
-                mSentResponse = true
-                val numberResult = getNumberResult()
-                val expiryResult = getExpiryResult()
-                
-                _scanResult.value = ScanResult.Success(
-                    cardNumber = numberResult,
-                    expiryMonth = expiryResult?.month?.toString(),
-                    expiryYear = expiryResult?.year?.toString()
-                )
-            }
-        }
-
-        mMachineLearningSemaphore.release()
-    }
-
-    private fun incrementNumber(number: String?) {
-        var currentValue = numberResults[number]
-        if (currentValue == null) {
-            currentValue = 0
-        }
-        numberResults[number] = currentValue + 1
-    }
-
-    private fun incrementExpiry(expiry: Expiry?) {
-        var currentValue = expiryResults[expiry]
-        if (currentValue == null) {
-            currentValue = 0
-        }
-        expiryResults[expiry] = currentValue + 1
-    }
-
-    private fun getNumberResult(): String? {
-        var result: String? = null
-        var maxValue = 0
-
-        for (number in numberResults.keys) {
-            var value = 0
-            val count = numberResults[number]
-            if (count != null) {
-                value = count
-            }
-            if (value > maxValue) {
-                result = number
-                maxValue = value
-            }
-        }
-
-        return result
-    }
-
-    private fun getExpiryResult(): Expiry? {
-        var result: Expiry? = null
-        var maxValue = 0
-
-        for (expiry in expiryResults.keys) {
-            var value = 0
-            val count = expiryResults[expiry]
-            if (count != null) {
-                value = count
-            }
-            if (value > maxValue) {
-                result = expiry
-                maxValue = value
-            }
-        }
-
-        return result
+    fun onActivityResume() {
+        resetScanState()
+        isActive = true
     }
 
     fun resetScanState() {
-        mSentResponse = false
-        mIsActivityActive = true
+        sentResponse = false
         firstResultMs = 0
         numberResults.clear()
         expiryResults.clear()
@@ -288,41 +205,89 @@ class ScanViewModel @Inject constructor(
         _scanResult.value = null
     }
 
-    fun setActivityActive(active: Boolean) {
-        mIsActivityActive = active
+    // ---- OnScanListener callbacks ----
+    override fun onFatalError() {
+        viewModelScope.launch {
+            _scanResult.value = ScanResult.Error("Fatal error occurred during scanning")
+        }
+    }
+
+    override fun onPrediction(
+        number: String?, expiry: Expiry?, bitmap: Bitmap?,
+        digitBoxes: MutableList<DetectedBox?>?, expiryBox: DetectedBox?
+    ) {
+        if (!sentResponse && isActive) {
+            if (number != null && firstResultMs == 0L) firstResultMs = System.currentTimeMillis()
+            if (number != null) incrementNumber(number)
+            if (expiry != null) incrementExpiry(expiry)
+
+            val duration = System.currentTimeMillis() - firstResultMs
+
+            // Update UI without recomposition on every frame
+            if (firstResultMs != 0L) {
+                val currentNumber = getNumberResult()
+                val currentExpiry = getExpiryResult()
+                _uiState.value = _uiState.value.copy(
+                    detectedCardNumber = currentNumber?.let { DebitCardUtils.format(it) },
+                    detectedExpiry = currentExpiry?.format(),
+                    showDetectedInfo = true
+                )
+            }
+
+            // Send final result after errorCorrectionDurationMs
+            if (firstResultMs != 0L && duration >= errorCorrectionDurationMs) {
+                sentResponse = true
+                val numberResult = getNumberResult()
+                val expiryResult = getExpiryResult()
+                _scanResult.value = ScanResult.Success(
+                    cardNumber = numberResult,
+                    expiryMonth = expiryResult?.month?.toString(),
+                    expiryYear = expiryResult?.year?.toString()
+                )
+            }
+            mlSemaphore.release()
+        }
+    }
+
+    private fun incrementNumber(number: String?) {
+        val current = numberResults[number] ?: 0
+        numberResults[number] = current + 1
+    }
+
+    private fun incrementExpiry(expiry: Expiry?) {
+        val current = expiryResults[expiry] ?: 0
+        expiryResults[expiry] = current + 1
+    }
+
+    private fun getNumberResult(): String? {
+        var result: String? = null
+        var maxValue = 0
+        for ((k, v) in numberResults) {
+            if ((v ?: 0) > maxValue) {
+                maxValue = v!!
+                result = k
+            }
+        }
+        return result
+    }
+
+    private fun getExpiryResult(): Expiry? {
+        var result: Expiry? = null
+        var maxValue = 0
+        for ((k, v) in expiryResults) {
+            if ((v ?: 0) > maxValue) {
+                maxValue = v!!
+                result = k
+            }
+        }
+        return result
     }
 
     override fun onCleared() {
         super.onCleared()
-        cameraProvider?.unbindAll()
+        isActive = false
+        cameraProvider = null
+        camera = null
+        analysisExecutor.shutdown()
     }
-}
-
-// Data classes for state management
-data class ScanUiState(
-    val scanCardText: String = "Scan your card",
-    val positionCardText: String = "Position your card in the frame",
-    val detectedCardNumber: String? = null,
-    val detectedExpiry: String? = null,
-    val showDetectedInfo: Boolean = false,
-    val debugMode: Boolean = false
-)
-
-data class CameraState(
-    val isInitialized: Boolean = false,
-    val isFlashlightOn: Boolean = false,
-    val hasError: Boolean = false,
-    val errorMessage: String? = null
-)
-
-sealed class ScanResult {
-    data class Success(
-        val cardNumber: String?,
-        val expiryMonth: String?,
-        val expiryYear: String?
-    ) : ScanResult()
-    
-    object Cancelled : ScanResult()
-    
-    data class Error(val message: String) : ScanResult()
 }

@@ -12,7 +12,6 @@ import androidx.compose.ui.Modifier
 import androidx.core.view.WindowCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.core.view.WindowInsetsControllerCompat
-import com.nymcard.cardsscan.activityimp.ScanActivityImpl
 import com.nymcard.cardsscan.base.ScanBaseActivity
 import dagger.hilt.android.AndroidEntryPoint
 
@@ -30,18 +29,18 @@ class ScanActivityCompose : ComponentActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        
-        // Warm up ML thread
+
+        // Only warm up ML thread if not already initialized
         ScanBaseActivity.warmUp(this)
-        
         // Enable edge-to-edge display
         enableEdgeToEdge()
-        
+
         // Hide system bars for immersive experience
         WindowCompat.setDecorFitsSystemWindows(window, false)
         WindowInsetsControllerCompat(window, window.decorView).let { controller ->
             controller.hide(WindowInsetsCompat.Type.systemBars())
-            controller.systemBarsBehavior = WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
+            controller.systemBarsBehavior =
+                WindowInsetsControllerCompat.BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE
         }
 
         // Get intent extras
@@ -56,10 +55,7 @@ class ScanActivityCompose : ComponentActivity() {
                     color = MaterialTheme.colorScheme.background
                 ) {
                     ScanCardScreen(
-                        scanCardText = scanCardText,
-                        positionCardText = positionCardText,
-                        debugMode = debugMode,
-                        onScanResult = { result ->
+                        onScanComplete = { result ->
                             handleScanResult(result)
                         }
                     )
@@ -79,10 +75,12 @@ class ScanActivityCompose : ComponentActivity() {
                 setResult(RESULT_OK, intent)
                 finish()
             }
+
             is ScanResult.Cancelled -> {
                 setResult(RESULT_CANCELED)
                 finish()
             }
+
             is ScanResult.Error -> {
                 val intent = Intent().apply {
                     putExtra(ScanBaseActivity.RESULT_FATAL_ERROR, true)
@@ -103,5 +101,10 @@ class ScanActivityCompose : ComponentActivity() {
         super.onPause()
         // Remove keep screen on flag
         window.clearFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON)
+    }
+
+    override fun onDestroy() {
+        super.onDestroy()
+        // Clean up any resources if needed
     }
 }
